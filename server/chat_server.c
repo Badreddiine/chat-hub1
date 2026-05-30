@@ -238,7 +238,11 @@ static void handle_message(int idx, const Message *m) {
 static void server_loop(void) {
     fd_set fds; int max_fd;
     while (1) {
-        FD_ZERO(&fds); FD_SET(tcp_sock, &fds); max_fd = tcp_sock;
+        FD_ZERO(&fds);
+        FD_SET(tcp_sock, &fds);
+        FD_SET(udp_sock, &fds);  /* ecouter UDP aussi */
+        max_fd = (tcp_sock > udp_sock) ? tcp_sock : udp_sock;
+
         pthread_mutex_lock(&lock);
         for (int i = 0; i < MAX_CLIENTS; i++)
             if (clients[i].fd > 0) {
@@ -251,6 +255,7 @@ static void server_loop(void) {
         int ready = select(max_fd + 1, &fds, NULL, NULL, &tv);
         if (ready < 0) { if (errno == EINTR) continue; perror("select"); break; }
 
+        /* Nouvelle connexion TCP */
         if (FD_ISSET(tcp_sock, &fds)) {
             struct sockaddr_in ca; socklen_t cl = sizeof(ca);
             int nfd = accept(tcp_sock, (struct sockaddr *)&ca, &cl);
@@ -268,6 +273,28 @@ static void server_loop(void) {
             }
         }
 
+        /* Message public UDP recu d un client */
+        if (FD_ISSET(udp_sock, &fds)) {
+            Message m;
+            struct sockaddr_in src; socklen_t slen = sizeof(src);
+            ssize_t n = recvfrom(udp_sock, &m, MSG_SIZE, 0,
+                                 (struct sockaddr *)&src, &slen);
+            if (n > 0 && m.type == MSG_PUBLIC) {
+                log_event("[UDP recu] %s: %s", m.from, m.body);
+                /* Trouver l index du client expediteur */
+                pthread_mutex_lock(&lock);
+                int sender_fd = -1;
+                for (int i = 0; i < MAX_CLIENTS; i++)
+                    if (clients[i].active &&
+                        strcmp(clients[i].pseudo, m.from) == 0) {
+                        sender_fd = clients[i].fd; break;
+                    }
+                broadcast_public(&m, sender_fd);
+                pthread_mutex_unlock(&lock);
+            }
+        }
+
+        /* Donnees TCP clients */
         pthread_mutex_lock(&lock);
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].fd <= 0 || !FD_ISSET(clients[i].fd, &fds)) continue;
