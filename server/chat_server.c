@@ -1,8 +1,8 @@
 /*
  * chat_server.c — Chat Hub Server
  * TCP  : connexions, auth, privés, notifications, keepalive
- * UDP  : broadcast vers chaque client (IP TCP + port UDP communiqué)
- * select() : multiplexage sans blocage
+ * UDP  : unicast vers chaque client (port communiqué à la connexion)
+ * TCP fallback : pour clients sur loopback (même machine)
  */
 
 #include <stdio.h>
@@ -25,12 +25,12 @@
 #define BACKLOG       16
 
 typedef struct {
-    int              fd;
-    char             pseudo[MAX_PSEUDO];
-    struct sockaddr_in udp_addr;   /* IP réelle + port UDP du client */
-    time_t           last_pong;
-    int              active;
-    int              udp_ready;   /* 1 si udp_addr est renseignée */
+    int            fd;
+    char           pseudo[MAX_PSEUDO];
+    struct sockaddr_in udp_addr;
+    time_t         last_pong;
+    int            active;
+    int            udp_ready;
 } Client;
 
 static Client  clients[MAX_CLIENTS];
@@ -58,19 +58,25 @@ static void send_system(int fd, const char *text) {
     send_tcp(fd, &m);
 }
 
-/* UDP unicast vers chaque client individuellement */
-static void broadcast_udp(const Message *m, int sender_fd) {
+/* UDP unicast vers chaque client + TCP fallback */
+static void broadcast_public(const Message *m, int sender_fd) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active) continue;
         if (clients[i].fd == sender_fd) continue;
-        if (!clients[i].udp_ready) continue;
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clients[i].udp_addr.sin_addr, ip, sizeof(ip));
-        log_event("[UDP] -> %s:%d (%s)", ip,
-                  ntohs(clients[i].udp_addr.sin_port), clients[i].pseudo);
-        sendto(udp_sock, m, MSG_SIZE, 0,
-               (struct sockaddr *)&clients[i].udp_addr,
-               sizeof(clients[i].udp_addr));
+
+        /* Essai UDP unicast */
+        if (clients[i].udp_ready) {
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clients[i].udp_addr.sin_addr, ip, sizeof(ip));
+            log_event("[UDP] -> %s:%d (%s)", ip,
+                      ntohs(clients[i].udp_addr.sin_port), clients[i].pseudo);
+            sendto(udp_sock, m, MSG_SIZE, 0,
+                   (struct sockaddr *)&clients[i].udp_addr,
+                   sizeof(clients[i].udp_addr));
+        }
+
+        /* TCP fallback (garantit la réception dans tous les cas) */
+        send_tcp(clients[i].fd, m);
     }
 }
 
@@ -144,17 +150,13 @@ static void handle_message(int idx, const Message *m) {
         int taken = (find_client(m->from) != NULL);
         if (!taken) {
             strncpy(c->pseudo, m->from, MAX_PSEUDO - 1);
-
-            /* Récupérer l'IP réelle depuis la socket TCP */
             struct sockaddr_in peer; socklen_t plen = sizeof(peer);
             getpeername(c->fd, (struct sockaddr *)&peer, &plen);
-
-            /* Port UDP envoyé dans le body */
             int udp_port = atoi(m->body);
             if (udp_port > 0) {
-                c->udp_addr      = peer;
+                c->udp_addr          = peer;
                 c->udp_addr.sin_port = htons((uint16_t)udp_port);
-                c->udp_ready     = 1;
+                c->udp_ready         = 1;
                 char ip[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
                 log_event("UDP client %s : %s:%d", m->from, ip, udp_port);
@@ -189,15 +191,21 @@ static void handle_message(int idx, const Message *m) {
     case MSG_PUBLIC:
         log_event("[PUBLIC] %s: %s", c->pseudo, m->body);
         pthread_mutex_lock(&lock);
-        broadcast_udp(m, c->fd);
+        broadcast_public(m, c->fd);
         pthread_mutex_unlock(&lock);
         break;
 
     case MSG_PRIVATE: {
         pthread_mutex_lock(&lock);
         Client *dest = find_client(m->to);
-        if (dest) { send_tcp(dest->fd, m); log_event("[PRIVE] %s->%s", c->pseudo, m->to); }
-        else { char e[MAX_MSG]; snprintf(e, sizeof(e), "Utilisateur '%s' introuvable.", m->to); send_system(c->fd, e); }
+        if (dest) {
+            send_tcp(dest->fd, m);
+            log_event("[PRIVE] %s -> %s", c->pseudo, m->to);
+        } else {
+            char e[MAX_MSG];
+            snprintf(e, sizeof(e), "Utilisateur '%s' introuvable.", m->to);
+            send_system(c->fd, e);
+        }
         pthread_mutex_unlock(&lock);
         break;
     }
@@ -212,11 +220,15 @@ static void handle_message(int idx, const Message *m) {
     }
 
     case MSG_PONG:
-        pthread_mutex_lock(&lock); c->last_pong = time(NULL); pthread_mutex_unlock(&lock);
+        pthread_mutex_lock(&lock);
+        c->last_pong = time(NULL);
+        pthread_mutex_unlock(&lock);
         break;
 
     case MSG_DISCONNECT:
-        pthread_mutex_lock(&lock); disconnect_client(idx); pthread_mutex_unlock(&lock);
+        pthread_mutex_lock(&lock);
+        disconnect_client(idx);
+        pthread_mutex_unlock(&lock);
         break;
 
     default: break;
@@ -229,7 +241,10 @@ static void server_loop(void) {
         FD_ZERO(&fds); FD_SET(tcp_sock, &fds); max_fd = tcp_sock;
         pthread_mutex_lock(&lock);
         for (int i = 0; i < MAX_CLIENTS; i++)
-            if (clients[i].fd > 0) { FD_SET(clients[i].fd, &fds); if (clients[i].fd > max_fd) max_fd = clients[i].fd; }
+            if (clients[i].fd > 0) {
+                FD_SET(clients[i].fd, &fds);
+                if (clients[i].fd > max_fd) max_fd = clients[i].fd;
+            }
         pthread_mutex_unlock(&lock);
 
         struct timeval tv = {1, 0};
@@ -244,7 +259,8 @@ static void server_loop(void) {
                 int s = find_free_slot();
                 if (s >= 0) {
                     memset(&clients[s], 0, sizeof(Client));
-                    clients[s].fd = nfd; clients[s].last_pong = time(NULL);
+                    clients[s].fd        = nfd;
+                    clients[s].last_pong = time(NULL);
                     log_event("Connexion depuis %s:%d (slot %d)",
                               inet_ntoa(ca.sin_addr), ntohs(ca.sin_port), s);
                 } else { close(nfd); }
@@ -258,7 +274,11 @@ static void server_loop(void) {
             Message m;
             ssize_t n = recv(clients[i].fd, &m, MSG_SIZE, MSG_WAITALL);
             if (n <= 0) { disconnect_client(i); }
-            else { pthread_mutex_unlock(&lock); handle_message(i, &m); pthread_mutex_lock(&lock); }
+            else {
+                pthread_mutex_unlock(&lock);
+                handle_message(i, &m);
+                pthread_mutex_lock(&lock);
+            }
         }
         pthread_mutex_unlock(&lock);
     }
@@ -272,22 +292,27 @@ int main(int argc, char *argv[]) {
 
     tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_sock < 0) { perror("socket TCP"); exit(1); }
-    int opt = 1; setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    int opt = 1;
+    setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in srv = {0};
-    srv.sin_family = AF_INET; srv.sin_addr.s_addr = INADDR_ANY; srv.sin_port = htons(tcp_port);
+    srv.sin_family = AF_INET; srv.sin_addr.s_addr = INADDR_ANY;
+    srv.sin_port   = htons((uint16_t)tcp_port);
     if (bind(tcp_sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) { perror("bind TCP"); exit(1); }
     if (listen(tcp_sock, BACKLOG) < 0) { perror("listen"); exit(1); }
 
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) { perror("socket UDP"); exit(1); }
     struct sockaddr_in usrv = {0};
-    usrv.sin_family = AF_INET; usrv.sin_addr.s_addr = INADDR_ANY; usrv.sin_port = htons(udp_port);
+    usrv.sin_family = AF_INET; usrv.sin_addr.s_addr = INADDR_ANY;
+    usrv.sin_port   = htons((uint16_t)udp_port);
     if (bind(udp_sock, (struct sockaddr *)&usrv, sizeof(usrv)) < 0) { perror("bind UDP"); exit(1); }
 
     memset(clients, 0, sizeof(clients));
     for (int i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
 
-    pthread_t pt; pthread_create(&pt, NULL, ping_thread, NULL); pthread_detach(pt);
+    pthread_t pt;
+    pthread_create(&pt, NULL, ping_thread, NULL);
+    pthread_detach(pt);
 
     printf("╔══════════════════════════════════════╗\n");
     printf("║       Chat Hub Server demarre        ║\n");
@@ -297,6 +322,7 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
 
     server_loop();
-    close(tcp_sock); close(udp_sock);
+    close(tcp_sock);
+    close(udp_sock);
     return 0;
 }
